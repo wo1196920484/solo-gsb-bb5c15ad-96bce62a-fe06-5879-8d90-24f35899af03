@@ -1,0 +1,387 @@
+"""HTTP 请求 / 响应的 Pydantic 模型。
+
+所有数据随请求传入，服务端不读取任何远程索引、不做磁盘缓存。
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+# PEP 503 允许的发行包名：字母数字点/连字符/下划线，首尾为字母或数字
+# （单字符包名也合法）。
+NAME_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
+
+
+class DependencyIn(BaseModel):
+    """一条声明式依赖（requires_dist 风格，支持 PEP 440 约束 + PEP 508 marker）。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="被依赖的发行包名（按 PEP 503 规范化后匹配）。",
+    )
+    specifier: str = Field(
+        "",
+        description="PEP 440 版本约束，如 '>=1.0,<2.0'；空字符串表示不约束。",
+    )
+    marker: str = Field(
+        "",
+        description=(
+            "PEP 508 环境标记表达式（不含分号），如 \"sys_platform == 'linux'\"；"
+            "仅允许引用 python_version / sys_platform / platform_machine，"
+            "空字符串表示无条件激活。"
+        ),
+    )
+
+
+class TargetEnvironmentIn(BaseModel):
+    """marker 求值所用的目标环境；三项必填且全部取自请求（不读宿主机）。"""
+
+    model_config = {"extra": "forbid"}
+
+    python_version: str = Field(
+        ...,
+        min_length=1,
+        description="目标解释器版本（PEP 440），如 '3.11'、'3.12.4'。",
+    )
+    sys_platform: str = Field(
+        ...,
+        min_length=1,
+        description="目标操作系统，对应 sys_platform，如 'linux'、'win32'、'darwin'。",
+    )
+    platform_machine: str = Field(
+        ...,
+        min_length=1,
+        description="目标 CPU 架构，对应 platform.machine()，如 'x86_64'、'aarch64'、'AMD64'。",
+    )
+
+
+class CandidateIn(BaseModel):
+    """仓库快照中的一个候选版本。"""
+
+    model_config = {"extra": "forbid"}
+
+    version: str = Field(..., min_length=1, description="PEP 440 版本号。")
+    dependencies: list[DependencyIn] = Field(
+        default_factory=list,
+        description="该版本声明的依赖（输出会做确定性排序，与声明顺序无关）。",
+    )
+
+
+class ResolveRequest(BaseModel):
+    """POST /resolve 的请求体。"""
+
+    model_config = {"extra": "forbid"}
+
+    repository: dict[str, list[CandidateIn]] = Field(
+        ...,
+        description=(
+            "仓库快照：键为包名（按 PEP 503 规范化匹配，大小写/下划线/点/连字符等价），"
+            "值为候选版本列表；列表顺序无关，内部按 PEP 440 版本降序排列。"
+        ),
+    )
+    root: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="根包名称；必须存在于 repository 中。",
+    )
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description=(
+            "必填的目标环境，用于求解决策与每条依赖的 PEP 508 marker；"
+            "值完全取自请求，服务端不读取宿主机信息。"
+        ),
+    )
+    specifier: str = Field(
+        "",
+        description="对根包的 PEP 440 版本约束，默认取最高版本。",
+    )
+    allow_prereleases: bool = Field(
+        False,
+        description="是否允许预发布版本（dev/a/b/rc）。默认关闭。",
+    )
+
+
+class UpgradeRequest(ResolveRequest):
+    """POST /upgrade 的请求体：在 /resolve 全部字段上附加当前锁定清单与升级目标。"""
+
+    model_config = {"extra": "forbid"}
+
+    current_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "当前锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "作为最小化变更的参照，不参与约束求解。"
+        ),
+    )
+    target: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="要升级的包名；必须存在于 current_lock 中，否则返回 422。",
+    )
+
+
+class AuditLockRequest(ResolveRequest):
+    """POST /audit-lock 的请求体：在 /resolve 全部字段上附加被审计的锁定清单。
+
+    审计不重新求解：current_lock 中的版本就是被检查的对象，而不是参照。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    current_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "被审计的锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "审计从根包按这些锁定版本遍历已激活依赖，不做任何版本选择。"
+        ),
+    )
+
+
+class DependencyPathsRequest(AuditLockRequest):
+    """POST /dependency-paths 的请求体：在锁定审计字段上附加目标包。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；仅当锁有效时才按
+    锁定版本建图，查询从根包到 target 的所有最短包路径。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="要解释的目标包名（PEP 503 规范化匹配）；不可达时返回 reachable=false。",
+    )
+
+
+# --------------------------------------------------------------------- #
+# 响应模型
+# --------------------------------------------------------------------- #
+class EdgeOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    from_: str = Field(..., alias="from", description="声明方，'root' 表示根请求。")
+    to: str = Field(..., description="被依赖方（规范化包名）。")
+    specifier: str = Field(..., description="声明的原始约束；空约束显示为 '*'。")
+
+
+class ResolveResponse(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str
+    root_version: str
+    locked: dict[str, str] = Field(
+        ..., description="确定性锁定清单：规范化包名 -> 版本。"
+    )
+    edges: list[EdgeOut] = Field(..., description="依赖边（已排序）。")
+
+
+class ChangeOut(BaseModel):
+    """单个包相对 current_lock 的变化。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    name: str = Field(..., description="规范化包名。")
+    from_: str | None = Field(
+        ..., alias="from", description="current_lock 中的版本；新增包为 null。"
+    )
+    to: str | None = Field(
+        ..., description="升级后锁定清单中的版本；被删除的包为 null。"
+    )
+
+
+class UpgradeResponse(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str
+    root_version: str
+    locked: dict[str, str] = Field(
+        ..., description="升级后的完整确定性锁定清单：规范化包名 -> 版本。"
+    )
+    changes: list[ChangeOut] = Field(
+        ...,
+        description=(
+            "相对 current_lock 的全部变化（含目标包），按包名排序；"
+            "from 为 null 表示新增，to 为 null 表示删除。"
+        ),
+    )
+
+
+class ChainLinkOut(BaseModel):
+    """来源链中的一跳。"""
+
+    model_config = {"extra": "forbid"}
+
+    package: str | None = Field(
+        ..., description="提出约束的包名；null 表示请求本身（根需求）。"
+    )
+    version: str | None = Field(
+        ..., description="提出约束的已选版本；根需求时为 null。"
+    )
+    requires: str = Field(..., description="该跳施加的原始约束文本。")
+
+
+class ConstraintChainOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    chain: list[ChainLinkOut] = Field(
+        ..., description="根需求 -> ... -> 冲突包的一条约束来源链。"
+    )
+
+
+class ConflictOut(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    subject: str = Field(..., description="冲突所针对的包名（规范化）。")
+    kind: Literal["incompatible", "no_candidates"]
+    message: str
+    constraints: list[ConstraintChainOut] = Field(
+        ..., description="对该包所有互不兼容的约束及其来源链。"
+    )
+    partial_selection: dict[str, str] = Field(
+        ..., description="冲突点上已确定的选择快照（规范化名 -> 版本）。"
+    )
+
+
+class UnresolvedResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["conflict", "limit"]
+    message: str
+    conflicts: list[ConflictOut]
+
+
+class InvalidSnapshotResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_snapshot"]
+    message: str
+
+
+# --------------------------------------------------------------------- #
+# POST /audit-lock 响应
+# --------------------------------------------------------------------- #
+class AuditConstraintOut(BaseModel):
+    """一条累计到被审计包上的入边约束及其来源。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    from_: str = Field(
+        ..., alias="from", description="声明方，'root' 表示根请求；否则为 'pkg==version'。"
+    )
+    specifier: str = Field(..., description="声明的原始约束；空约束显示为 '*'。")
+
+
+class AuditConstraintViolationOut(AuditConstraintOut):
+    """constraint_mismatch 中一条未被锁定版本满足的约束。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    satisfies: bool = Field(
+        ...,
+        description=(
+            "锁定版本是否满足该约束（PEP 440）；该列表中恒为 false。"
+            "missing/unavailable/extraneous 的约束不携带此字段。"
+        ),
+    )
+
+
+class AuditIssueOut(BaseModel):
+    """一条审计问题；每个包的每种类型至多一条。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    type: Literal["missing", "unavailable", "constraint_mismatch", "extraneous"] = (
+        Field(..., description=(
+            "missing=可达包未锁定；unavailable=锁定版本不在快照；"
+            "constraint_mismatch=锁定版本不满足根或依赖约束；"
+            "extraneous=锁中包不可达。"
+        ))
+    )
+    name: str = Field(..., description="问题所针对的包名（PEP 503 规范化）。")
+    locked_version: str | None = Field(
+        ..., description="锁定清单中的版本；missing 时为 null。"
+    )
+    available: list[str] = Field(
+        ...,
+        description=(
+            "快照中该包的全部可用版本（PEP 440 降序）；"
+            "包不在快照中时为空列表。"
+        ),
+    )
+    constraints: list[AuditConstraintViolationOut | AuditConstraintOut] = Field(
+        ...,
+        description=(
+            "累计到该包的全部入边约束（含根约束，已去重并按来源排序）；"
+            "constraint_mismatch 仅列出未满足的约束（逐条带 satisfies=false）；"
+            "extraneous 恒为空。"
+        ),
+    )
+
+
+class AuditLockResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    valid: bool = Field(..., description="issues 为空时为 true。")
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "审计问题，确定性排序：先按类型"
+            "（missing、unavailable、constraint_mismatch、extraneous），"
+            "再按规范化包名。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /dependency-paths 响应
+# --------------------------------------------------------------------- #
+class DependencyPathsResponse(BaseModel):
+    """锁有效时的路径查询结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    target: str = Field(..., description="规范化目标包名。")
+    reachable: bool = Field(
+        ...,
+        description=(
+            "目标是否出现在锁定清单并从根包可达；为 false 时 paths 恒为空。"
+        ),
+    )
+    paths: list[list[str]] = Field(
+        ...,
+        description=(
+            "根包到目标包的所有最短包路径（每条为规范化包名序列，含首尾）；"
+            "菱形依赖的等长路径全部保留；路径整体按字典序确定性排序。"
+        ),
+    )
+
+
+class InvalidLockResponse(BaseModel):
+    """锁定清单未通过审计：409，不执行路径查询。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["invalid_lock"]
+    message: str
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "与 /audit-lock 完全一致的审计问题，确定性排序：先按类型"
+            "（missing、unavailable、constraint_mismatch、extraneous），"
+            "再按规范化包名。"
+        ),
+    )
