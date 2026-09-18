@@ -73,8 +73,12 @@ class CandidateIn(BaseModel):
     )
 
 
-class ResolveRequest(BaseModel):
-    """POST /resolve 的请求体。"""
+class _ResolveInputs(BaseModel):
+    """各求解端点（/resolve、/resolve-matrix 等）共用的请求输入。
+
+    只含与具体目标环境无关的字段；单环境端点再附加 ``target_environment``，
+    多环境矩阵端点附加 ``target_environments``。
+    """
 
     model_config = {"extra": "forbid"}
 
@@ -91,13 +95,6 @@ class ResolveRequest(BaseModel):
         pattern=NAME_PATTERN,
         description="根包名称；必须存在于 repository 中。",
     )
-    target_environment: TargetEnvironmentIn = Field(
-        ...,
-        description=(
-            "必填的目标环境，用于求解决策与每条依赖的 PEP 508 marker；"
-            "值完全取自请求，服务端不读取宿主机信息。"
-        ),
-    )
     specifier: str = Field(
         "",
         description="对根包的 PEP 440 版本约束，默认取最高版本。",
@@ -105,6 +102,52 @@ class ResolveRequest(BaseModel):
     allow_prereleases: bool = Field(
         False,
         description="是否允许预发布版本（dev/a/b/rc）。默认关闭。",
+    )
+
+
+class ResolveRequest(_ResolveInputs):
+    """POST /resolve 的请求体。"""
+
+    model_config = {"extra": "forbid"}
+
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description=(
+            "必填的目标环境，用于求解决策与每条依赖的 PEP 508 marker；"
+            "值完全取自请求，服务端不读取宿主机信息。"
+        ),
+    )
+
+
+class MatrixTargetEnvironmentIn(TargetEnvironmentIn):
+    """/resolve-matrix 的目标环境：在三项环境值上附加调用方给定的唯一 id。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description=(
+            "环境标识，用于在结果中对应各环境锁定清单与矩阵列；"
+            "同一次请求内必须唯一（重复返回 422）。"
+        ),
+    )
+
+
+class ResolveMatrixRequest(_ResolveInputs):
+    """POST /resolve-matrix 的请求体：同一份快照在 2～8 个目标环境下分别求解。"""
+
+    model_config = {"extra": "forbid"}
+
+    target_environments: list[MatrixTargetEnvironmentIn] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description=(
+            "2～8 个目标环境，每个带调用方给定的唯一 id；"
+            "各环境独立复用 /resolve 的全部求解规则（marker 激活、回溯、预发布开关）。"
+        ),
     )
 
 
@@ -266,6 +309,82 @@ class InvalidSnapshotResponse(BaseModel):
 
     status: Literal["invalid_snapshot"]
     message: str
+
+
+# --------------------------------------------------------------------- #
+# POST /resolve-matrix 响应
+# --------------------------------------------------------------------- #
+class MatrixEnvironmentOut(BaseModel):
+    """单个目标环境的求解结果；results 按 id 排序。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(..., description="与请求 target_environments[].id 对应。")
+    root_version: str = Field(
+        ...,
+        description=(
+            "该环境锁定的根包版本；根版本也可能因环境相关回溯而不同，"
+            "差异同样体现在 matrix 的根包行上。"
+        ),
+    )
+    locked: dict[str, str] = Field(
+        ..., description="该环境下的确定性锁定清单：规范化包名 -> 版本。"
+    )
+
+
+class MatrixPackageOut(BaseModel):
+    """matrix 中的一行：一个包在各环境的版本及跨环境一致标记。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="规范化包名（PEP 503）。")
+    versions: dict[str, str | None] = Field(
+        ...,
+        description=(
+            "环境 id -> 该环境锁定的版本；该包未出现在某环境的锁定清单中时为 null。"
+        ),
+    )
+    state: Literal["shared", "divergent"] = Field(
+        ...,
+        description=(
+            "shared=每个环境都锁定且版本完全相同；"
+            "divergent=版本不同，或该包只出现在部分环境（对应 versions 中为 null）。"
+        ),
+    )
+
+
+class ResolveMatrixResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str
+    results: list[MatrixEnvironmentOut] = Field(
+        ..., description="各目标环境的锁定清单，按 id 排序（含各自的 root_version）。"
+    )
+    matrix: list[MatrixPackageOut] = Field(
+        ..., description="跨环境版本矩阵，按包名排序（根包同样是其中一行）。"
+    )
+
+
+class MatrixFailureOut(BaseModel):
+    """409 时一个失败环境的原冲突结果（与 /resolve 的 409 内容一致）。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str
+    status: Literal["conflict", "limit"]
+    message: str
+    conflicts: list[ConflictOut]
+
+
+class MatrixUnresolvedResponse(BaseModel):
+    """任一目标环境无解：整体 409，列出各失败环境的原冲突结果（按 id 排序）。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["conflict"]
+    message: str
+    failures: list[MatrixFailureOut]
 
 
 # --------------------------------------------------------------------- #

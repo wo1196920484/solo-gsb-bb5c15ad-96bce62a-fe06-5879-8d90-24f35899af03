@@ -6,6 +6,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 搜索生成**确定性锁定清单**；无解时返回从根需求到冲突包的**约束来源链**。
 `/upgrade` 在现有锁定清单（`current_lock`）上升级单个目标包：取能完成
 整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
+`/resolve-matrix` 把**同一份快照与根约束**提交给 **2～8 个带唯一 `id` 的
+目标环境**：逐环境复用 `/resolve` 的全部规则求解，返回按 `id` 排序的各环境
+锁定清单，以及按包名排序的跨环境版本矩阵（每个包记录各环境版本——未出现为
+`null`——并标记 `shared` / `divergent`），用于快速定位跨平台锁定差异。
 `/audit-lock` 对现有锁定清单做**只审计、不重新求解**的自洽性检查：按锁定
 版本从根包遍历已激活依赖，报告缺失、版本不可用、约束不满足与多余的包。
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
@@ -39,6 +43,7 @@ docker compose up --build
 | --- | --- |
 | API 根地址 | `http://localhost:8000` |
 | 解析接口 | `POST http://localhost:8000/resolve` |
+| 跨环境矩阵接口 | `POST http://localhost:8000/resolve-matrix` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
@@ -275,6 +280,161 @@ curl -s -X POST http://localhost:8000/resolve \
 | `422` | 请求/快照非法：非 PEP 440 版本、非法约束串、**marker 语法非法或引用越界变量**、`target_environment` 缺失/字段非法、根包不在快照中、字段校验失败等 |
 
 `GET /healthz` 返回 `{"status":"ok"}`。
+
+### `POST /resolve-matrix`
+
+同一份仓库快照与根约束，一次提交给 **2～8 个目标环境**分别求解，直接得到
+跨平台锁定差异。请求体沿用 `/resolve` 的 `repository` / `root` /
+`specifier` / `allow_prereleases`（语义完全一致），只把单个
+`target_environment` 换成带唯一 `id` 的 `target_environments` 列表：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target_environments` | `array` | 是 | **2～8 个**目标环境；少于 2 个或多于 8 个返回 422 |
+| `target_environments[].id` | `string` | 是 | 环境标识（PEP 503 包名字符集：字母数字与 `._-`，首尾为字母/数字）；同一次请求内**必须唯一**，重复返回 422 |
+| `target_environments[].python_version` | `string` | 是 | 同 `/resolve` 的 `target_environment.python_version` |
+| `target_environments[].sys_platform` | `string` | 是 | 同上 |
+| `target_environments[].platform_machine` | `string` | 是 | 同上 |
+
+每个环境**独立复用 `/resolve` 的全部求解规则**（marker 激活、MRV/回溯、
+预发布跟随语义、尝试上限），互不影响。快照与根约束只校验一次。
+
+```bash
+curl -s -X POST http://localhost:8000/resolve-matrix \
+  -H 'Content-Type: application/json' \
+  -d @examples/resolve-matrix.json
+```
+
+示例把前述跨平台快照提交给三个环境（Linux x86_64 / Windows AMD64 /
+Linux aarch64）。**全部环境有解时返回 200**：`results` 是各环境的
+`root_version` 与 `locked`，**按 `id` 排序**；`matrix` 是跨环境版本矩阵，
+**按包名排序**——每行给出该包在每个环境的版本（未出现在该环境锁定清单中
+为 `null`），并标记：
+
+- `"shared"`：每个环境都锁定了该包且版本完全相同；
+- `"divergent"`：版本不同，或该包只出现在部分环境（对应 `versions` 中的 `null`）。
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "results": [
+    {
+      "id": "linux-arm64-py311",
+      "root_version": "2.0.0",
+      "locked": {
+        "app": "2.0.0",
+        "linux-helper": "1.2.0",
+        "modern-core": "4.0.0",
+        "native-bindings": "2"
+      }
+    },
+    {
+      "id": "linux-x64-py311",
+      "root_version": "2.0.0",
+      "locked": {
+        "app": "2.0.0",
+        "linux-helper": "1.2.0",
+        "modern-core": "4.0.0",
+        "native-bindings": "2",
+        "speedlib": "1.0.0"
+      }
+    },
+    {
+      "id": "win-amd64-py39",
+      "root_version": "2.0.0",
+      "locked": {
+        "app": "2.0.0",
+        "legacy-core": "0.9.0",
+        "native-bindings": "1",
+        "win-helper": "1.2.0"
+      }
+    }
+  ],
+  "matrix": [
+    {
+      "name": "app",
+      "versions": {"linux-arm64-py311": "2.0.0", "linux-x64-py311": "2.0.0", "win-amd64-py39": "2.0.0"},
+      "state": "shared"
+    },
+    {
+      "name": "native-bindings",
+      "versions": {"linux-arm64-py311": "2", "linux-x64-py311": "2", "win-amd64-py39": "1"},
+      "state": "divergent"
+    },
+    {
+      "name": "speedlib",
+      "versions": {"linux-arm64-py311": null, "linux-x64-py311": "1.0.0", "win-amd64-py39": null},
+      "state": "divergent"
+    }
+  ]
+}
+```
+
+（为节省篇幅，上例 `matrix` 只展开了三行；实际响应包含全部出现在任一环境
+锁定清单中的包。）由矩阵可直接读出：根包三环境一致（`shared`）；
+`native-bindings` 在 Windows 被锁到 `1`、Linux 锁到 `2`（版本差异型
+`divergent`）；`speedlib` 只在 x86_64 激活（缺失型 `divergent`，缺失列为
+`null`）。根包本身也是矩阵的一行：环境相关的回溯可能让某些环境改选更低的
+根版本，此时该根包行同样为 `divergent`，各环境实际锁定的根版本以
+`results[].root_version` 为准。
+
+**任一环境无解时整体返回 409**（即使其他环境有解），服务端仍会跑完全部
+环境，`failures` 按 `id` 排序列出**各失败环境的原冲突结果**——内容与对该
+环境单独调用 `/resolve` 得到的 409 完全一致（`status` / `message` /
+`conflicts` 约束来源链）：
+
+```bash
+curl -s -X POST http://localhost:8000/resolve-matrix \
+  -H 'Content-Type: application/json' \
+  -d @examples/resolve-matrix-conflict.json
+```
+
+```json
+{
+  "status": "conflict",
+  "message": "1 个目标环境无解（共 2 个）：win-amd64",
+  "failures": [
+    {
+      "id": "win-amd64",
+      "status": "conflict",
+      "message": "依赖约束无解，冲突包：core",
+      "conflicts": [
+        {
+          "subject": "core",
+          "kind": "incompatible",
+          "message": "已选 core==1.0 与约束交集 ==1.0,==2.0 不兼容",
+          "constraints": [
+            {"chain": [
+              {"package": null, "version": null, "requires": "*"},
+              {"package": "app", "version": "1.0.0", "requires": "*"},
+              {"package": "left", "version": "1.0", "requires": "==1.0"}
+            ]},
+            {"chain": [
+              {"package": null, "version": null, "requires": "*"},
+              {"package": "app", "version": "1.0.0", "requires": "*"},
+              {"package": "right", "version": "1.0", "requires": "==2.0"}
+            ]}
+          ],
+          "partial_selection": {"app": "1.0.0", "core": "1.0", "left": "1.0", "right": "1.0"}
+        }
+      ]
+    }
+  ]
+}
+```
+
+上例中 `left → core==1.0` 无条件激活，而 `right → core==2.0` 只在
+`win32` 激活：Linux 环境正常锁定，Windows 环境互斥冲突，因此整体 409 且
+`failures` 只含 `win-amd64`（409 响应不返回成功环境的锁定清单）。
+
+`/resolve-matrix` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 全部环境求解成功，返回按 `id` 排序的 `results`（各含 `root_version` 与 `locked`）与按包名排序的 `matrix` |
+| `409` | 至少一个环境无解或超过搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境的原冲突结果（单环境的 `status` 也可能为 `"limit"`） |
+| `422` | 请求/快照非法（同 `/resolve`），或环境数量不在 2～8、`id` 非法、**`id` 重复** |
 
 ### `POST /upgrade`
 
@@ -578,6 +738,13 @@ curl -s -X POST http://localhost:8000/dependency-paths \
     到目标包的全部最短包路径：菱形等长路径全保留，环不重复节点、不会无限
     遍历，路径按字典序确定性排序；目标为根包返回单节点路径，不可达返回
     `reachable: false` 与空路径。
+12. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
+    带唯一 `id` 的目标环境上各跑一遍第 2～8 条的同一套求解（环境间完全
+    独立、各自回溯与冲突收集）。全部成功时 `results` 按 `id` 排序给出各
+    环境锁定清单，`matrix` 按包名排序逐包记录各环境版本（未出现为
+    `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
+    环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
+    排序给出各失败环境与 `/resolve` 同形的原冲突结果。
 
 ### 安全护栏
 
@@ -596,7 +763,7 @@ app/
   repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker、/upgrade、/audit-lock、/dependency-paths 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

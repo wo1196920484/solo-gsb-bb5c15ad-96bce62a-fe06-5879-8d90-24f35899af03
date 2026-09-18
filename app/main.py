@@ -2,6 +2,11 @@
 
 * POST /resolve     提交仓库快照 + 根包 + 版本约束 + 目标环境（PEP 508 marker
   在请求环境下求值），返回锁定清单或冲突来源链
+* POST /resolve-matrix
+  同一份快照 + 根约束 + 2～8 个带唯一 id 的目标环境：逐环境复用 /resolve
+  规则求解，全部成功时返回按 id 排序的各环境 locked 与按包名排序的跨环境
+  版本矩阵（shared/divergent）；任一环境无解则整体 409，列出各失败环境的
+  原冲突结果
 * POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
@@ -37,6 +42,9 @@ from .schemas import (
     DependencyPathsResponse,
     InvalidLockResponse,
     InvalidSnapshotResponse,
+    ResolveMatrixRequest,
+    ResolveMatrixResponse,
+    MatrixUnresolvedResponse,
     ResolveRequest,
     ResolveResponse,
     UnresolvedResponse,
@@ -51,7 +59,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -88,6 +96,37 @@ def _conflict_payload(raw: dict) -> dict:
 @app.get("/healthz", summary="健康检查")
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+def _resolve_once(
+    *,
+    repository_payload: dict,
+    target_environment: dict,
+    root_canonical: str,
+    specifier: str,
+    allow_prereleases: bool,
+) -> tuple[dict | None, dict | None]:
+    """按 /resolve 的既有规则对单个目标环境求解一次。
+
+    返回 ``(ok_payload, conflict_payload)``，二者恰有一个非 None：
+
+    * 成功：``ok_payload`` 为 build_output 的 200 响应体；
+    * 无解或超上限：``conflict_payload`` 为 _conflict_payload 的 409 响应体。
+
+    快照/约束构造期的 SnapshotError 不在此捕获，由调用方映射为 422。
+    """
+    repo = build_repository(repository_payload, target_environment)
+    root_spec = parse_root_specifier(specifier)
+
+    resolver = Resolver(repo, allow_prereleases=allow_prereleases)
+    try:
+        state = resolver.resolve(root_canonical, root_spec, specifier)
+    except ResolutionLimit:
+        return None, _conflict_payload(resolver.build_conflicts(limit=True))
+
+    if state is not None:
+        return resolver.build_output(state, root_canonical), None
+    return None, _conflict_payload(resolver.build_conflicts())
 
 
 @app.post(
@@ -137,6 +176,132 @@ def resolve(request: ResolveRequest):
         status_code=409,
         content=_conflict_payload(resolver.build_conflicts()),
     )
+
+
+@app.post(
+    "/resolve-matrix",
+    summary="同一份快照在 2～8 个目标环境下分别求解并给出跨环境版本矩阵",
+    response_model=ResolveMatrixResponse,
+    responses={
+        409: {
+            "model": MatrixUnresolvedResponse,
+            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+        },
+        422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
+    },
+)
+def resolve_matrix(request: ResolveMatrixRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    # id 唯一性在路由层校验：Pydantic 的 pattern/min_length 负责格式，
+    # 重复值在此返回 422，不进入任何求解。
+    seen: set[str] = set()
+    for env in request.target_environments:
+        if env.id in seen:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "invalid_snapshot",
+                    "message": f"target_environments 的 id {env.id!r} 重复，必须唯一",
+                },
+            )
+        seen.add(env.id)
+
+    # marker 解析/求值与根约束非法属于 422；根包只查一次（与环境无关）。
+    try:
+        repo_known = build_repository(
+            payload["repository"], payload["target_environments"][0]
+        )
+        parse_root_specifier(request.specifier)
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo_known.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 逐环境独立求解：每个环境一个全新 Resolver，冲突收集互不干扰；
+    # 即使某环境已无解也继续跑完全部环境，以便 409 列出所有失败环境。
+    successes: dict[str, dict] = {}
+    failures: list[dict] = []
+    for env in payload["target_environments"]:
+        env_id = env["id"]
+        try:
+            ok, conflict = _resolve_once(
+                repository_payload=payload["repository"],
+                target_environment=env,
+                root_canonical=root_canonical,
+                specifier=request.specifier,
+                allow_prereleases=request.allow_prereleases,
+            )
+        except SnapshotError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "invalid_snapshot", "message": str(exc)},
+            )
+        if ok is not None:
+            successes[env_id] = ok
+        else:
+            assert conflict is not None
+            failures.append({"id": env_id, **conflict})
+
+    if failures:
+        failures.sort(key=lambda f: f["id"])
+        ids = "、".join(f["id"] for f in failures)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "conflict",
+                "message": (
+                    f"{len(failures)} 个目标环境无解（共 "
+                    f"{len(request.target_environments)} 个）：{ids}"
+                ),
+                "failures": failures,
+            },
+        )
+
+    # 全部成功：results 按 id 排序；matrix 按包名排序，逐包收集各环境版本。
+    ordered_ids = sorted(successes)
+    results = [
+        {
+            "id": env_id,
+            "root_version": successes[env_id]["root_version"],
+            "locked": successes[env_id]["locked"],
+        }
+        for env_id in ordered_ids
+    ]
+    all_packages = sorted(
+        {pkg for ok in successes.values() for pkg in ok["locked"]}
+    )
+    matrix = []
+    for pkg in all_packages:
+        versions = {
+            env_id: successes[env_id]["locked"].get(pkg) for env_id in ordered_ids
+        }
+        resolved = [v for v in versions.values() if v is not None]
+        state = (
+            "shared"
+            if len(resolved) == len(ordered_ids)
+            and len(set(resolved)) == 1
+            else "divergent"
+        )
+        matrix.append({"name": pkg, "versions": versions, "state": state})
+
+    return {
+        "status": "ok",
+        "root": root_canonical,
+        "results": results,
+        "matrix": matrix,
+    }
 
 
 def _lock_changes(
