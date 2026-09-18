@@ -11,6 +11,11 @@
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
   有效则按锁定版本与目标环境已激活依赖建图，返回根包到目标包的
   全部最短包路径（菱形保留等长路径，环安全、确定性排序）
+* POST /resolve-matrix
+  对同一快照在 2~8 个带唯一 id 的目标环境下逐个按 /resolve 规则求解；
+  全部成功时返回各环境 locked 与按包名排序的跨环境版本矩阵
+  （shared/divergent），任一环境无解则整体 409 并列出各失败环境的
+  原冲突结果
 * GET  /healthz     健康检查
 """
 
@@ -37,6 +42,9 @@ from .schemas import (
     DependencyPathsResponse,
     InvalidLockResponse,
     InvalidSnapshotResponse,
+    ResolveMatrixRequest,
+    ResolveMatrixResponse,
+    ResolveMatrixUnresolvedResponse,
     ResolveRequest,
     ResolveResponse,
     UnresolvedResponse,
@@ -51,7 +59,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -345,4 +353,127 @@ def dependency_paths_endpoint(request: DependencyPathsRequest):
         "target": target_canonical,
         "reachable": bool(paths),
         "paths": paths,
+    }
+
+
+@app.post(
+    "/resolve-matrix",
+    summary="对同一快照在多个目标环境下分别求解并汇总跨环境版本矩阵",
+    response_model=ResolveMatrixResponse,
+    responses={
+        409: {
+            "model": ResolveMatrixUnresolvedResponse,
+            "description": "任一目标环境无解或超过搜索上限",
+        },
+        422: {
+            "model": InvalidSnapshotResponse,
+            "description": "快照、环境 id 或请求非法",
+        },
+    },
+)
+def resolve_matrix(request: ResolveMatrixRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        root_spec = parse_root_specifier(request.specifier)
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    # 求解、结果与失败列表都按环境 id 排序，保证确定性。
+    environments = sorted(request.target_environments, key=lambda e: e.id)
+
+    locked_by_id: dict[str, dict[str, str]] = {}
+    failures: list[dict] = []
+    for env in environments:
+        try:
+            repo = build_repository(
+                payload["repository"],
+                {
+                    "python_version": env.python_version,
+                    "sys_platform": env.sys_platform,
+                    "platform_machine": env.platform_machine,
+                },
+            )
+        except SnapshotError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "invalid_snapshot",
+                    "message": f"目标环境 {env.id!r}：{exc}",
+                },
+            )
+
+        if not repo.known(root_canonical):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "status": "invalid_snapshot",
+                    "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+                },
+            )
+
+        resolver = Resolver(repo, allow_prereleases=request.allow_prereleases)
+        try:
+            state = resolver.resolve(root_canonical, root_spec, request.specifier)
+        except ResolutionLimit:
+            failures.append(
+                {"id": env.id, **_conflict_payload(resolver.build_conflicts(limit=True))}
+            )
+            continue
+        if state is None:
+            failures.append(
+                {"id": env.id, **_conflict_payload(resolver.build_conflicts())}
+            )
+            continue
+        locked_by_id[env.id] = {
+            pkg: str(ver) for pkg, ver in sorted(state.selection.items())
+        }
+
+    # 任一环境无解：整体 409，只列出失败环境的原冲突结果（按 id 排序）。
+    if failures:
+        status = (
+            "limit"
+            if all(f["status"] == "limit" for f in failures)
+            else "conflict"
+        )
+        ids = "、".join(f["id"] for f in failures)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": status,
+                "message": f"{len(failures)} 个目标环境无法解析：{ids}",
+                "failures": failures,
+            },
+        )
+
+    # 全部成功：按包名排序的跨环境版本矩阵。包在全部环境中锁定且版本
+    # 按 PEP 440 相等时为 shared，否则（版本不同或部分环境缺失）为 divergent。
+    env_ids = [env.id for env in environments]
+    all_packages = sorted(
+        {pkg for locked in locked_by_id.values() for pkg in locked}
+    )
+    matrix = []
+    for name in all_packages:
+        versions = {env_id: locked_by_id[env_id].get(name) for env_id in env_ids}
+        present = [v for v in versions.values() if v is not None]
+        shared = len(present) == len(env_ids) and len({Version(v) for v in present}) == 1
+        matrix.append(
+            {
+                "name": name,
+                "versions": versions,
+                "status": "shared" if shared else "divergent",
+            }
+        )
+
+    return {
+        "status": "ok",
+        "root": root_canonical,
+        "environments": [
+            {"id": env_id, "locked": locked_by_id[env_id]} for env_id in env_ids
+        ],
+        "matrix": matrix,
     }

@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 # PEP 503 允许的发行包名：字母数字点/连字符/下划线，首尾为字母或数字
 # （单字符包名也合法）。
@@ -160,6 +160,74 @@ class DependencyPathsRequest(AuditLockRequest):
         pattern=NAME_PATTERN,
         description="要解释的目标包名（PEP 503 规范化匹配）；不可达时返回 reachable=false。",
     )
+
+
+class MatrixTargetEnvironmentIn(TargetEnvironmentIn):
+    """带唯一 id 的目标环境；id 只作为结果中的标签，不参与求解。"""
+
+    model_config = {"extra": "forbid"}
+
+    # 先去除首尾空白再做长度校验：纯空白 id 视为非法（422）。
+    id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] = (
+        Field(
+            ...,
+            description=(
+                "目标环境的唯一标签（非空白字符串）；结果按 id 排序，"
+                "matrix 的 versions 以 id 为键。"
+            ),
+        )
+    )
+
+
+class ResolveMatrixRequest(BaseModel):
+    """POST /resolve-matrix 的请求体：/resolve 字段 + 2~8 个带唯一 id 的目标环境。"""
+
+    model_config = {"extra": "forbid"}
+
+    repository: dict[str, list[CandidateIn]] = Field(
+        ...,
+        description=(
+            "仓库快照：键为包名（按 PEP 503 规范化匹配，大小写/下划线/点/连字符等价），"
+            "值为候选版本列表；列表顺序无关，内部按 PEP 440 版本降序排列。"
+        ),
+    )
+    root: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="根包名称；必须存在于 repository 中。",
+    )
+    target_environments: list[MatrixTargetEnvironmentIn] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description=(
+            "2~8 个目标环境，每个带唯一 id；逐个环境按 /resolve 的同一套规则求解，"
+            "环境值完全取自请求，服务端不读取宿主机信息。"
+        ),
+    )
+    specifier: str = Field(
+        "",
+        description="对根包的 PEP 440 版本约束，默认取最高版本。",
+    )
+    allow_prereleases: bool = Field(
+        False,
+        description="是否允许预发布版本（dev/a/b/rc）。默认关闭。",
+    )
+
+    @field_validator("target_environments")
+    @classmethod
+    def _unique_environment_ids(
+        cls, envs: list[MatrixTargetEnvironmentIn]
+    ) -> list[MatrixTargetEnvironmentIn]:
+        ids = [env.id for env in envs]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise ValueError(
+                "target_environments 的 id 必须唯一，重复："
+                + "、".join(repr(i) for i in duplicates)
+            )
+        return envs
 
 
 # --------------------------------------------------------------------- #
@@ -384,4 +452,82 @@ class InvalidLockResponse(BaseModel):
             "（missing、unavailable、constraint_mismatch、extraneous），"
             "再按规范化包名。"
         ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /resolve-matrix 响应
+# --------------------------------------------------------------------- #
+class MatrixEnvironmentOut(BaseModel):
+    """单个目标环境的求解结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(..., description="请求中该环境的唯一 id。")
+    locked: dict[str, str] = Field(
+        ..., description="该环境下的确定性锁定清单：规范化包名 -> 版本（按包名排序）。"
+    )
+
+
+class MatrixRowOut(BaseModel):
+    """matrix 中的一行：一个包在各目标环境下的锁定版本对照。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="规范化包名（PEP 503）。")
+    versions: dict[str, str | None] = Field(
+        ...,
+        description=(
+            "环境 id -> 该环境锁定的版本；该环境未锁定此包时为 null；"
+            "键按环境 id 排序。"
+        ),
+    )
+    status: Literal["shared", "divergent"] = Field(
+        ...,
+        description=(
+            "shared=全部环境都锁定且版本按 PEP 440 相等；"
+            "divergent=版本不一致或部分环境未锁定此包。"
+        ),
+    )
+
+
+class ResolveMatrixResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str
+    environments: list[MatrixEnvironmentOut] = Field(
+        ..., description="各环境的锁定清单，按环境 id 排序。"
+    )
+    matrix: list[MatrixRowOut] = Field(
+        ...,
+        description=(
+            "跨环境版本矩阵：按规范化包名排序，每包记录各环境版本"
+            "（未出现为 null）与 shared/divergent 标记。"
+        ),
+    )
+
+
+class MatrixFailureOut(BaseModel):
+    """单个失败环境的完整冲突结果（与 /resolve 的 409 响应一致，附加环境 id）。"""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(..., description="失败环境的 id。")
+    status: Literal["conflict", "limit"]
+    message: str
+    conflicts: list[ConflictOut]
+
+
+class ResolveMatrixUnresolvedResponse(BaseModel):
+    """任一目标环境无解：409，只列出失败环境的原冲突结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["conflict", "limit"] = Field(
+        ..., description="全部失败均为超限时为 limit，否则为 conflict。"
+    )
+    message: str
+    failures: list[MatrixFailureOut] = Field(
+        ..., description="失败环境的原冲突结果，按环境 id 排序。"
     )
